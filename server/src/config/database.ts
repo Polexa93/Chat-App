@@ -31,12 +31,31 @@ export const connectDB = (): Promise<sqlite3.Database> => {
           )
         `, (err) => {
           if (err) {
-            console.error('Error creating table:', err.message);
+            console.error('Error creating users table:', err.message);
             reject(err);
             return;
           }
-          console.log('Database tables initialized');
-          resolve(db!);
+          
+          // Create messages table if it doesn't exist
+          db!.run(`
+            CREATE TABLE IF NOT EXISTS messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              senderId INTEGER NOT NULL,
+              receiverId INTEGER NOT NULL,
+              text TEXT NOT NULL,
+              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (senderId) REFERENCES users(id),
+              FOREIGN KEY (receiverId) REFERENCES users(id)
+            )
+          `, (err) => {
+            if (err) {
+              console.error('Error creating messages table:', err.message);
+              reject(err);
+              return;
+            }
+            console.log('Database tables initialized');
+            resolve(db!);
+          });
         });
       });
     } catch (error) {

@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { connectDB } from './config/database';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/users';
+import messageRoutes from './routes/messages';
 
 // Load environment variables
 dotenv.config();
@@ -29,6 +30,7 @@ app.use(express.urlencoded({ extended: true }));
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/messages', messageRoutes);
 
 // Health check route
 app.get('/api/health', (_req: Request, res: Response) => {

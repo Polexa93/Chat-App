@@ -46,3 +46,25 @@ export interface DatabaseResult {
   changes: number;
 }
 
+export interface Message {
+  id: number;
+  senderId: number;
+  receiverId: number;
+  text: string;
+  createdAt: string;
+}
+
+export interface CreateMessageData {
+  receiverId: number;
+  text: string;
+}
+
+export interface MessageWithSender {
+  id: number;
+  senderId: number;
+  receiverId: number;
+  text: string;
+  createdAt: string;
+  senderName: string;
+}
+

@@ -211,6 +211,24 @@
   border-left: 3px solid #667eea;
 }
 
+.contact-item.has-unread {
+  background: #fff3e0;
+  border-left: 3px solid #ff9800;
+}
+
+.contact-item.has-unread.active {
+  background: #ffe0b2;
+  border-left: 3px solid #ff9800;
+}
+
+.contact-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  position: relative;
+}
+
 .contact-avatar {
   width: 45px;
   height: 45px;
@@ -246,7 +264,7 @@
 }
 
 .unread-badge {
-  background: #667eea;
+  background: #ff9800;
   color: white;
   border-radius: 12px;
   padding: 2px 8px;
@@ -254,6 +272,34 @@
   font-weight: 600;
   min-width: 20px;
   text-align: center;
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.contact-close-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: #999;
+  transition: all 0.2s ease;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+}
+
+.contact-close-btn:hover {
+  background: #ffebee;
+  color: #f44336;
+}
+
+.contact-close-btn:active {
+  transform: scale(0.9);
 }
 
 /* Main Chat Area */
