@@ -67,6 +67,9 @@ router.post('/signup', async (req: Request, res: Response<AuthResponse>) => {
           id: user.id,
           name: user.name,
           email: user.email,
+          status: user.status,
+          lastActive: user.lastActive,
+          avatarUrl: user.avatarUrl,
           createdAt: user.createdAt,
           updatedAt: user.updatedAt,
         },
@@ -132,6 +135,9 @@ router.post('/login', async (req: Request, res: Response<AuthResponse>) => {
           id: user.id,
           name: user.name,
           email: user.email,
+          status: user.status,
+          lastActive: user.lastActive,
+          avatarUrl: user.avatarUrl,
           createdAt: user.createdAt,
           updatedAt: user.updatedAt,
         },
@@ -177,6 +183,9 @@ router.get('/me', protect, async (req: AuthRequest, res: Response) => {
           id: user.id,
           name: user.name,
           email: user.email,
+          status: user.status,
+          lastActive: user.lastActive,
+          avatarUrl: user.avatarUrl,
           createdAt: user.createdAt,
           updatedAt: user.updatedAt,
         },
@@ -185,6 +194,145 @@ router.get('/me', protect, async (req: AuthRequest, res: Response) => {
   } catch (error) {
     const err = error as Error;
     console.error('Get user error:', err);
+    res.status(500).json({
+      success: false,
+      message: err.message || 'Server error',
+    });
+  }
+});
+
+// @route   PUT /api/auth/status
+// @desc    Heartbeat - update current user's presence status
+// @access  Private
+router.put('/status', protect, async (req: AuthRequest, res: Response) => {
+  try {
+    const currentUserId = req.user?.id;
+    const { status } = req.body;
+
+    if (!currentUserId) {
+      res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+      return;
+    }
+
+    if (status !== 'online' && status !== 'away') {
+      res.status(400).json({
+        success: false,
+        message: 'Status must be "online" or "away"',
+      });
+      return;
+    }
+
+    await User.updateStatus(currentUserId, status);
+
+    res.status(200).json({
+      success: true,
+      message: 'Status updated',
+    });
+  } catch (error) {
+    const err = error as Error;
+    console.error('Update status error:', err);
+    res.status(500).json({
+      success: false,
+      message: err.message || 'Server error',
+    });
+  }
+});
+
+// @route   PUT /api/auth/profile
+// @desc    Update current user's name
+// @access  Private
+router.put('/profile', protect, async (req: AuthRequest, res: Response) => {
+  try {
+    const currentUserId = req.user?.id;
+    const { name } = req.body;
+
+    if (!currentUserId) {
+      res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+      return;
+    }
+
+    if (!name || !name.trim()) {
+      res.status(400).json({
+        success: false,
+        message: 'Name is required',
+      });
+      return;
+    }
+
+    if (name.trim().length > 50) {
+      res.status(400).json({
+        success: false,
+        message: 'Name must be 50 characters or fewer',
+      });
+      return;
+    }
+
+    const user = await User.updateProfile(currentUserId, name.trim());
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated',
+      data: { user },
+    });
+  } catch (error) {
+    const err = error as Error;
+    console.error('Update profile error:', err);
+    res.status(500).json({
+      success: false,
+      message: err.message || 'Server error',
+    });
+  }
+});
+
+// @route   PUT /api/auth/avatar
+// @desc    Update current user's avatar image (base64 data URL)
+// @access  Private
+router.put('/avatar', protect, async (req: AuthRequest, res: Response) => {
+  try {
+    const currentUserId = req.user?.id;
+    const { avatarUrl } = req.body;
+
+    if (!currentUserId) {
+      res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      });
+      return;
+    }
+
+    if (!avatarUrl || typeof avatarUrl !== 'string' || !avatarUrl.startsWith('data:image/')) {
+      res.status(400).json({
+        success: false,
+        message: 'A valid image is required',
+      });
+      return;
+    }
+
+    // Roughly 2MB decoded limit (base64 is ~1.37x the decoded size)
+    if (avatarUrl.length > 2.8 * 1024 * 1024) {
+      res.status(400).json({
+        success: false,
+        message: 'Image is too large. Please choose a smaller image.',
+      });
+      return;
+    }
+
+    const user = await User.updateAvatar(currentUserId, avatarUrl);
+
+    res.status(200).json({
+      success: true,
+      message: 'Avatar updated',
+      data: { user },
+    });
+  } catch (error) {
+    const err = error as Error;
+    console.error('Update avatar error:', err);
     res.status(500).json({
       success: false,
       message: err.message || 'Server error',

@@ -2,8 +2,18 @@ import { useState, useRef, useEffect } from 'react';
 import './Chat.css';
 import { searchUsers } from '../services/userService';
 import { getMessages, sendMessage, getContactsWithMessages } from '../services/messageService';
+import { updateStatus } from '../services/authService';
+import { getEffectiveStatus, STATUS_LABELS, IDLE_THRESHOLD_MS, HEARTBEAT_INTERVAL_MS } from '../utils/presence';
+import Avatar from './Avatar';
+import ProfileSettingsModal from './ProfileSettingsModal';
 
-function Chat({ user, onSignOut }) {
+// Small colored dot reflecting online / away / offline status
+function StatusDot({ status }) {
+  return <span className={`status-dot status-dot-${status}`} />;
+}
+
+function Chat({ user, onSignOut, onUpdateUser }) {
+  const [showSettings, setShowSettings] = useState(false);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [selectedContact, setSelectedContact] = useState(null);
@@ -12,11 +22,46 @@ function Chat({ user, onSignOut }) {
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [myStatus, setMyStatus] = useState('online');
   const messagesEndRef = useRef(null);
   const contactsRef = useRef([]);
+  const lastActivityRef = useRef(Date.now());
 
   const CONTACTS_STORAGE_KEY = `chatApp_contacts_${user.id}`;
   const LAST_READ_STORAGE_KEY = `chatApp_lastRead_${user.id}`;
+
+  // Track own presence: send heartbeats while active, flip to "away" after
+  // IDLE_THRESHOLD_MS of no mouse/keyboard/touch activity.
+  useEffect(() => {
+    const handleActivity = () => {
+      lastActivityRef.current = Date.now();
+      setMyStatus((prev) => (prev === 'away' ? 'online' : prev));
+    };
+
+    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'];
+    activityEvents.forEach((evt) => window.addEventListener(evt, handleActivity));
+
+    const sendHeartbeat = (status) => {
+      updateStatus(status);
+    };
+
+    // Check idle state and send a heartbeat on a steady interval
+    const heartbeatInterval = setInterval(() => {
+      const idleFor = Date.now() - lastActivityRef.current;
+      const nextStatus = idleFor >= IDLE_THRESHOLD_MS ? 'away' : 'online';
+      setMyStatus(nextStatus);
+      sendHeartbeat(nextStatus);
+    }, HEARTBEAT_INTERVAL_MS);
+
+    // Send an initial heartbeat right away so we don't show as offline on load
+    sendHeartbeat('online');
+
+    return () => {
+      activityEvents.forEach((evt) => window.removeEventListener(evt, handleActivity));
+      clearInterval(heartbeatInterval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Load contacts from localStorage and backend on mount
   useEffect(() => {
@@ -40,6 +85,9 @@ function Chat({ user, onSignOut }) {
             email: contact.email,
             lastMessage: contact.lastMessage || 'No messages yet',
             unread: 0,
+            status: contact.status,
+            lastActive: contact.lastActive,
+            avatarUrl: contact.avatarUrl,
           }));
 
           // Merge local and backend contacts, avoiding duplicates
@@ -85,10 +133,13 @@ function Chat({ user, onSignOut }) {
           transformedBackendContacts.forEach((contact) => {
             const existing = contactMap.get(contact.id);
             if (existing) {
-              // Update last message if backend has a newer one
+              // Update last message and presence if backend has newer info
               contactMap.set(contact.id, {
                 ...existing,
                 lastMessage: contact.lastMessage,
+                status: contact.status,
+                lastActive: contact.lastActive,
+                avatarUrl: contact.avatarUrl,
               });
             } else {
               // Add new contact from backend
@@ -112,6 +163,22 @@ function Chat({ user, onSignOut }) {
 
     loadContacts();
   }, [CONTACTS_STORAGE_KEY]);
+
+  // Keep the selected contact's presence/profile in sync as `contacts` is refreshed in the background
+  useEffect(() => {
+    if (!selectedContact) return;
+    const updated = contacts.find((c) => c.id === selectedContact.id);
+    if (
+      updated &&
+      (updated.status !== selectedContact.status ||
+        updated.lastActive !== selectedContact.lastActive ||
+        updated.avatarUrl !== selectedContact.avatarUrl ||
+        updated.name !== selectedContact.name)
+    ) {
+      setSelectedContact(updated);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contacts]);
 
   // Save contacts to localStorage whenever they change
   useEffect(() => {
@@ -262,6 +329,9 @@ function Chat({ user, onSignOut }) {
           email: contact.email,
           lastMessage: contact.lastMessage || 'No messages yet',
           unread: 0,
+          status: contact.status,
+          lastActive: contact.lastActive,
+          avatarUrl: contact.avatarUrl,
         }));
 
         // Update contacts list with any new contacts from backend
@@ -274,10 +344,13 @@ function Chat({ user, onSignOut }) {
           transformedBackendContacts.forEach((contact) => {
             const existing = contactMap.get(contact.id);
             if (existing) {
-              // Update last message
+              // Update last message and presence
               contactMap.set(contact.id, {
                 ...existing,
                 lastMessage: contact.lastMessage,
+                status: contact.status,
+                lastActive: contact.lastActive,
+                avatarUrl: contact.avatarUrl,
               });
             } else {
               // Add new contact
@@ -595,6 +668,9 @@ function Chat({ user, onSignOut }) {
         email: userToAdd.email,
         lastMessage: 'No messages yet',
         unread: 0,
+        status: userToAdd.status,
+        lastActive: userToAdd.lastActive,
+        avatarUrl: userToAdd.avatarUrl,
       };
       setContacts([...contacts, newContact]);
       setSelectedContact(newContact);
@@ -611,20 +687,39 @@ function Chat({ user, onSignOut }) {
         <div className="chat-sidebar">
           <div className="sidebar-header">
             <div className="user-profile">
-              <div className="avatar">{user.name.charAt(0).toUpperCase()}</div>
+              <div className="avatar-wrapper">
+                <Avatar name={user.name} avatarUrl={user.avatarUrl} className="avatar" />
+                <StatusDot status={myStatus} />
+              </div>
               <div className="user-details">
                 <div className="user-name">{user.name}</div>
-                <div className="user-status">Online</div>
+                <div className={`user-status user-status-${myStatus}`}>{STATUS_LABELS[myStatus]}</div>
               </div>
             </div>
-            <button onClick={onSignOut} className="sidebar-sign-out" title="Sign Out">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
-                <polyline points="16 17 21 12 16 7"></polyline>
-                <line x1="21" y1="12" x2="9" y2="12"></line>
-              </svg>
-            </button>
+            <div className="sidebar-header-actions">
+              <button onClick={() => setShowSettings(true)} className="sidebar-sign-out" title="Profile Settings">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+              </button>
+              <button onClick={onSignOut} className="sidebar-sign-out" title="Sign Out">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                  <polyline points="16 17 21 12 16 7"></polyline>
+                  <line x1="21" y1="12" x2="9" y2="12"></line>
+                </svg>
+              </button>
+            </div>
           </div>
+
+          {showSettings && (
+            <ProfileSettingsModal
+              user={user}
+              onClose={() => setShowSettings(false)}
+              onUpdateUser={onUpdateUser}
+            />
+          )}
 
           <div className="contacts-section">
             <div className="contacts-header">
@@ -653,7 +748,7 @@ function Chat({ user, onSignOut }) {
                     className="search-result-item"
                     onClick={() => handleAddContact(result)}
                   >
-                    <div className="contact-avatar">{result.name.charAt(0).toUpperCase()}</div>
+                    <Avatar name={result.name} avatarUrl={result.avatarUrl} className="contact-avatar" />
                     <div className="contact-info">
                       <div className="contact-name">{result.name}</div>
                     </div>
@@ -676,7 +771,10 @@ function Chat({ user, onSignOut }) {
                     className={`contact-item ${selectedContact?.id === contact.id ? 'active' : ''} ${contact.unread > 0 ? 'has-unread' : ''}`}
                     onClick={() => setSelectedContact(contact)}
                   >
-                    <div className="contact-avatar">{contact.name.charAt(0).toUpperCase()}</div>
+                    <div className="avatar-wrapper">
+                      <Avatar name={contact.name} avatarUrl={contact.avatarUrl} className="contact-avatar" />
+                      <StatusDot status={getEffectiveStatus(contact.status, contact.lastActive)} />
+                    </div>
                     <div className="contact-info">
                       <div className="contact-name">{contact.name}</div>
                       <div className="contact-last-message">{contact.lastMessage}</div>
@@ -708,10 +806,15 @@ function Chat({ user, onSignOut }) {
               {/* Chat Header */}
               <div className="chat-header">
                 <div className="chat-header-info">
-                  <div className="chat-avatar">{selectedContact.name.charAt(0).toUpperCase()}</div>
+                  <div className="avatar-wrapper">
+                    <Avatar name={selectedContact.name} avatarUrl={selectedContact.avatarUrl} className="chat-avatar" />
+                    <StatusDot status={getEffectiveStatus(selectedContact.status, selectedContact.lastActive)} />
+                  </div>
                   <div>
                     <div className="chat-contact-name">{selectedContact.name}</div>
-                    <div className="chat-contact-status">Online</div>
+                    <div className={`chat-contact-status chat-contact-status-${getEffectiveStatus(selectedContact.status, selectedContact.lastActive)}`}>
+                      {STATUS_LABELS[getEffectiveStatus(selectedContact.status, selectedContact.lastActive)]}
+                    </div>
                   </div>
                 </div>
               </div>

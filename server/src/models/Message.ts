@@ -63,7 +63,7 @@ class MessageModel {
     }));
   }
 
-  static async getConversationPartners(userId: number): Promise<Array<{ id: number; name: string; email: string; lastMessage: string; lastMessageTime: string }>> {
+  static async getConversationPartners(userId: number): Promise<Array<{ id: number; name: string; email: string; lastMessage: string; lastMessageTime: string; status?: string; lastActive?: string | null; avatarUrl?: string | null }>> {
     // Get all messages where user is sender or receiver
     const allMessages = await dbAll<Message>(
       `SELECT * FROM messages 
@@ -87,8 +87,8 @@ class MessageModel {
     }
 
     // Fetch user details for all partners
-    const partners: Array<{ id: number; name: string; email: string; lastMessage: string; lastMessageTime: string }> = [];
-    
+    const partners: Array<{ id: number; name: string; email: string; lastMessage: string; lastMessageTime: string; status?: string; lastActive?: string | null; avatarUrl?: string | null }> = [];
+
     for (const partnerId of partnerIds) {
       const partner = await User.findById(partnerId);
       if (partner) {
@@ -99,6 +99,9 @@ class MessageModel {
           email: partner.email,
           lastMessage: lastMsg?.text || 'No messages yet',
           lastMessageTime: lastMsg?.time || new Date().toISOString(),
+          status: partner.status,
+          lastActive: partner.lastActive,
+          avatarUrl: partner.avatarUrl,
         });
       }
     }

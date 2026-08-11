@@ -6,6 +6,9 @@ export interface User {
   name: string;
   email: string;
   password?: string;
+  status?: string;
+  lastActive?: string | null;
+  avatarUrl?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -14,6 +17,9 @@ export interface UserWithoutPassword {
   id: number;
   name: string;
   email: string;
+  status?: string;
+  lastActive?: string | null;
+  avatarUrl?: string | null;
   createdAt: string;
   updatedAt: string;
 }

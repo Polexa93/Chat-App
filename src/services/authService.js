@@ -88,6 +88,44 @@ const setCurrentUser = (user) => {
   }
 };
 
+// Update the display name
+export const updateProfile = async (name) => {
+  try {
+    const response = await apiRequest('/auth/profile', {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    });
+
+    if (response.success && response.data) {
+      setCurrentUser(response.data.user);
+      return response.data.user;
+    }
+
+    throw new Error(response.message || 'Failed to update profile');
+  } catch (error) {
+    throw error;
+  }
+};
+
+// Update the avatar image (avatarUrl is a base64 data URL)
+export const updateAvatar = async (avatarUrl) => {
+  try {
+    const response = await apiRequest('/auth/avatar', {
+      method: 'PUT',
+      body: JSON.stringify({ avatarUrl }),
+    });
+
+    if (response.success && response.data) {
+      setCurrentUser(response.data.user);
+      return response.data.user;
+    }
+
+    throw new Error(response.message || 'Failed to update avatar');
+  } catch (error) {
+    throw error;
+  }
+};
+
 // Get JWT token
 export const getToken = () => {
   return localStorage.getItem(TOKEN_KEY);
@@ -107,6 +145,19 @@ export const signOut = () => {
 // Check if user is authenticated
 export const isAuthenticated = () => {
   return getToken() !== null && getCurrentUser() !== null;
+};
+
+// Send a presence heartbeat ('online' or 'away') to the server
+export const updateStatus = async (status) => {
+  try {
+    await apiRequest('/auth/status', {
+      method: 'PUT',
+      body: JSON.stringify({ status }),
+    });
+  } catch (error) {
+    // Non-critical - presence heartbeats can fail silently
+    console.error('Error updating status:', error);
+  }
 };
 
 // Verify token and get current user from server

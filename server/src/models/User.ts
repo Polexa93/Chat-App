@@ -66,6 +66,29 @@ class UserModel {
     return await bcrypt.compare(enteredPassword, hashedPassword);
   }
 
+  static async updateStatus(userId: number, status: 'online' | 'away'): Promise<void> {
+    await dbRun(
+      `UPDATE users SET status = ?, lastActive = CURRENT_TIMESTAMP WHERE id = ?`,
+      [status, userId]
+    );
+  }
+
+  static async updateAvatar(userId: number, avatarUrl: string): Promise<UserWithoutPassword | null> {
+    await dbRun(
+      `UPDATE users SET avatarUrl = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+      [avatarUrl, userId]
+    );
+    return this.findById(userId);
+  }
+
+  static async updateProfile(userId: number, name: string): Promise<UserWithoutPassword | null> {
+    await dbRun(
+      `UPDATE users SET name = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+      [name, userId]
+    );
+    return this.findById(userId);
+  }
+
   static async searchUsers(query: string, excludeUserId: number): Promise<UserWithoutPassword[]> {
     const searchTerm = `%${query.toLowerCase()}%`;
     

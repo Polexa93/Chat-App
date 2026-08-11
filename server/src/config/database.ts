@@ -26,6 +26,9 @@ export const connectDB = (): Promise<sqlite3.Database> => {
             name TEXT NOT NULL,
             email TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
+            status TEXT DEFAULT 'offline',
+            lastActive DATETIME,
+            avatarUrl TEXT,
             createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
             updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
           )
@@ -35,7 +38,13 @@ export const connectDB = (): Promise<sqlite3.Database> => {
             reject(err);
             return;
           }
-          
+
+          // Add columns for databases created before they existed.
+          // SQLite has no "ADD COLUMN IF NOT EXISTS", so ignore duplicate-column errors.
+          db!.run(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'offline'`, () => {});
+          db!.run(`ALTER TABLE users ADD COLUMN lastActive DATETIME`, () => {});
+          db!.run(`ALTER TABLE users ADD COLUMN avatarUrl TEXT`, () => {});
+
           // Create messages table if it doesn't exist
           db!.run(`
             CREATE TABLE IF NOT EXISTS messages (
