@@ -29,21 +29,38 @@ class MessageModel {
 
   static async getConversation(
     userId1: number,
-    userId2: number
-  ): Promise<MessageWithSender[]> {
-    const messages = await dbAll<Message & { senderName: string }>(
+    userId2: number,
+    options: { before?: number; limit?: number } = {}
+  ): Promise<{ messages: MessageWithSender[]; hasMore: boolean }> {
+    const limit = options.limit ?? 50;
+
+    // Fetch the newest page first (optionally older than `before`), then
+    // reverse it into chronological order for display.
+    const params: any[] = [userId1, userId2, userId2, userId1];
+    let beforeClause = '';
+    if (options.before) {
+      beforeClause = 'AND m.id < ?';
+      params.push(options.before);
+    }
+    params.push(limit + 1); // fetch one extra to detect if there's more
+
+    const rows = await dbAll<Message & { senderName: string }>(
       `SELECT m.*, u.name as senderName
        FROM messages m
        JOIN users u ON m.senderId = u.id
-       WHERE (m.senderId = ? AND m.receiverId = ?) OR (m.senderId = ? AND m.receiverId = ?)
-       ORDER BY m.createdAt ASC`,
-      [userId1, userId2, userId2, userId1]
+       WHERE ((m.senderId = ? AND m.receiverId = ?) OR (m.senderId = ? AND m.receiverId = ?)) ${beforeClause}
+       ORDER BY m.id DESC
+       LIMIT ?`,
+      params
     );
 
-    return messages.map(({ senderName, ...message }) => ({
-      ...message,
-      senderName,
-    }));
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit).reverse();
+
+    return {
+      messages: page.map(({ senderName, ...message }) => ({ ...message, senderName })),
+      hasMore,
+    };
   }
 
   static async getMessagesForUser(userId: number): Promise<MessageWithSender[]> {

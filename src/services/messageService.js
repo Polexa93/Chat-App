@@ -31,15 +31,22 @@ export const getContactsWithMessages = async () => {
   }
 };
 
-// Get messages for a conversation with a contact
-export const getMessages = async (contactId) => {
+// Get messages for a conversation with a contact.
+// Pass `before` (a message id) to page backwards through older history.
+// Returns { messages, hasMore }.
+export const getMessages = async (contactId, { before, limit } = {}) => {
   try {
     const token = getToken();
     if (!token) {
       throw new Error('Not authenticated');
     }
 
-    const response = await fetch(`${API_URL}/messages/${contactId}`, {
+    const params = new URLSearchParams();
+    if (before) params.set('before', before);
+    if (limit) params.set('limit', limit);
+    const query = params.toString() ? `?${params.toString()}` : '';
+
+    const response = await fetch(`${API_URL}/messages/${contactId}${query}`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -53,7 +60,7 @@ export const getMessages = async (contactId) => {
       throw new Error(data.message || 'Failed to fetch messages');
     }
 
-    return data.data.messages;
+    return { messages: data.data.messages, hasMore: !!data.data.hasMore };
   } catch (error) {
     throw error;
   }

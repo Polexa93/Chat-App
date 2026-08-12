@@ -62,8 +62,26 @@ export const connectDB = (): Promise<sqlite3.Database> => {
               reject(err);
               return;
             }
-            console.log('Database tables initialized');
-            resolve(db!);
+            // Create contacts table if it doesn't exist (explicit "saved contact" relationships)
+            db!.run(`
+              CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                userId INTEGER NOT NULL,
+                contactId INTEGER NOT NULL,
+                createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (userId) REFERENCES users(id),
+                FOREIGN KEY (contactId) REFERENCES users(id),
+                UNIQUE(userId, contactId)
+              )
+            `, (err) => {
+              if (err) {
+                console.error('Error creating contacts table:', err.message);
+                reject(err);
+                return;
+              }
+              console.log('Database tables initialized');
+              resolve(db!);
+            });
           });
         });
       });

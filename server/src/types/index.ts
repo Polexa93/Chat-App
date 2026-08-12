@@ -1,5 +1,4 @@
 import { Request } from 'express';
-import { Database } from 'sqlite3';
 
 export interface User {
   id: number;

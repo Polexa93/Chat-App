@@ -3,6 +3,8 @@ import jwt from 'jsonwebtoken';
 import User from '../models/User';
 import { protect } from '../middleware/auth';
 import { AuthRequest, AuthResponse } from '../types';
+import { getPasswordError } from '../utils/validators';
+import { getIO } from '../socket';
 
 const router = express.Router();
 
@@ -29,10 +31,11 @@ router.post('/signup', async (req: Request, res: Response<AuthResponse>) => {
       return;
     }
 
-    if (password.length < 6) {
+    const passwordError = getPasswordError(password);
+    if (passwordError) {
       res.status(400).json({
         success: false,
-        message: 'Password must be at least 6 characters',
+        message: passwordError,
       });
       return;
     }
@@ -275,6 +278,10 @@ router.put('/profile', protect, async (req: AuthRequest, res: Response) => {
 
     const user = await User.updateProfile(currentUserId, name.trim());
 
+    if (user) {
+      getIO().emit('profile:update', { id: user.id, name: user.name, avatarUrl: user.avatarUrl });
+    }
+
     res.status(200).json({
       success: true,
       message: 'Profile updated',
@@ -324,6 +331,10 @@ router.put('/avatar', protect, async (req: AuthRequest, res: Response) => {
     }
 
     const user = await User.updateAvatar(currentUserId, avatarUrl);
+
+    if (user) {
+      getIO().emit('profile:update', { id: user.id, name: user.name, avatarUrl: user.avatarUrl });
+    }
 
     res.status(200).json({
       success: true,

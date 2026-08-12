@@ -2,7 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import './Chat.css';
 import { searchUsers } from '../services/userService';
 import { getMessages, sendMessage, getContactsWithMessages } from '../services/messageService';
-import { updateStatus } from '../services/authService';
+import { getContacts as getSavedContacts, addContact as addContactApi, removeContact as removeContactApi } from '../services/contactService';
+import { connectSocket, disconnectSocket, getSocket } from '../services/socket';
 import { getEffectiveStatus, STATUS_LABELS, IDLE_THRESHOLD_MS, HEARTBEAT_INTERVAL_MS } from '../utils/presence';
 import Avatar from './Avatar';
 import ProfileSettingsModal from './ProfileSettingsModal';
@@ -11,6 +12,85 @@ import ProfileSettingsModal from './ProfileSettingsModal';
 function StatusDot({ status }) {
   return <span className={`status-dot status-dot-${status}`} />;
 }
+
+// A single row in either the "Contacts" or "All Chats" list
+function ContactRow({ person, isActive, isSaved, onSelect, onAddToContacts, onRemove, removeTitle }) {
+  const effectiveStatus = getEffectiveStatus(person.status, person.lastActive);
+  return (
+    <div
+      className={`contact-item ${isActive ? 'active' : ''} ${person.unread > 0 ? 'has-unread' : ''}`}
+      onClick={() => onSelect(person)}
+    >
+      <div className="avatar-wrapper">
+        <Avatar name={person.name} avatarUrl={person.avatarUrl} className="contact-avatar" />
+        <StatusDot status={effectiveStatus} />
+      </div>
+      <div className="contact-info">
+        <div className="contact-name">{person.name}</div>
+        <div className="contact-last-message">{person.lastMessage || 'No messages yet'}</div>
+      </div>
+      {person.unread > 0 && <div className="unread-badge">{person.unread}</div>}
+      <div className="contact-item-actions">
+        {!isSaved && onAddToContacts && (
+          <button
+            className="contact-add-btn"
+            onClick={(e) => onAddToContacts(e, person)}
+            title="Add to Contacts"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+        )}
+        {onRemove && (
+          <button
+            className="contact-close-btn"
+            onClick={(e) => onRemove(e, person.id)}
+            title={removeTitle || 'Remove'}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Collapsible header for a contacts-list group ("Contacts" / "All Chats")
+function ContactsGroupHeader({ title, isOpen, onToggle }) {
+  return (
+    <button type="button" className="contacts-group-header" onClick={onToggle}>
+      <svg
+        className={`contacts-group-chevron ${isOpen ? 'open' : ''}`}
+        width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+      >
+        <polyline points="9 18 15 12 9 6"></polyline>
+      </svg>
+      <span className="contacts-group-title">{title}</span>
+    </button>
+  );
+}
+
+// Chat bubble icon used across empty states
+function ChatBubbleIcon({ size = 28 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+    </svg>
+  );
+}
+
+const transformMessage = (msg) => ({
+  id: msg.id,
+  text: msg.text,
+  sender: msg.senderId,
+  senderName: msg.senderName,
+  timestamp: msg.createdAt,
+});
 
 function Chat({ user, onSignOut, onUpdateUser }) {
   const [showSettings, setShowSettings] = useState(false);
@@ -22,48 +102,191 @@ function Chat({ user, onSignOut, onUpdateUser }) {
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
+  const [isContactTyping, setIsContactTyping] = useState(false);
   const [myStatus, setMyStatus] = useState('online');
+  const [savedContacts, setSavedContacts] = useState([]);
+  const [isContactsOpen, setIsContactsOpen] = useState(false);
+  const [isChatsOpen, setIsChatsOpen] = useState(false);
   const messagesEndRef = useRef(null);
   const contactsRef = useRef([]);
+  const selectedContactRef = useRef(null);
   const lastActivityRef = useRef(Date.now());
+  const typingTimeoutRef = useRef(null);
+  const shouldAutoScrollRef = useRef(true);
 
   const CONTACTS_STORAGE_KEY = `chatApp_contacts_${user.id}`;
   const LAST_READ_STORAGE_KEY = `chatApp_lastRead_${user.id}`;
 
-  // Track own presence: send heartbeats while active, flip to "away" after
-  // IDLE_THRESHOLD_MS of no mouse/keyboard/touch activity.
+  useEffect(() => {
+    selectedContactRef.current = selectedContact;
+  }, [selectedContact]);
+
+  // Connect the realtime socket for the lifetime of the chat screen
+  useEffect(() => {
+    connectSocket();
+    return () => {
+      disconnectSocket();
+    };
+  }, []);
+
+  // Track own presence: flip to "away" after IDLE_THRESHOLD_MS of no activity,
+  // and push status changes over the socket (the server marks us online/offline
+  // automatically based on the socket connection itself).
   useEffect(() => {
     const handleActivity = () => {
       lastActivityRef.current = Date.now();
-      setMyStatus((prev) => (prev === 'away' ? 'online' : prev));
+      setMyStatus((prev) => {
+        if (prev === 'away') {
+          getSocket()?.emit('presence:set', 'online');
+          return 'online';
+        }
+        return prev;
+      });
     };
 
     const activityEvents = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'];
     activityEvents.forEach((evt) => window.addEventListener(evt, handleActivity));
 
-    const sendHeartbeat = (status) => {
-      updateStatus(status);
-    };
-
-    // Check idle state and send a heartbeat on a steady interval
-    const heartbeatInterval = setInterval(() => {
+    const idleCheckInterval = setInterval(() => {
       const idleFor = Date.now() - lastActivityRef.current;
       const nextStatus = idleFor >= IDLE_THRESHOLD_MS ? 'away' : 'online';
-      setMyStatus(nextStatus);
-      sendHeartbeat(nextStatus);
+      setMyStatus((prev) => {
+        if (prev !== nextStatus) getSocket()?.emit('presence:set', nextStatus);
+        return nextStatus;
+      });
     }, HEARTBEAT_INTERVAL_MS);
-
-    // Send an initial heartbeat right away so we don't show as offline on load
-    sendHeartbeat('online');
 
     return () => {
       activityEvents.forEach((evt) => window.removeEventListener(evt, handleActivity));
-      clearInterval(heartbeatInterval);
+      clearInterval(idleCheckInterval);
+    };
+  }, []);
+
+  // Realtime event listeners: new messages, presence, profile changes, typing
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+
+    const handleNewMessage = (rawMessage) => {
+      const transformed = transformMessage(rawMessage);
+      const otherPartyId = rawMessage.senderId === user.id ? rawMessage.receiverId : rawMessage.senderId;
+      const isOpenChat = selectedContactRef.current?.id === otherPartyId;
+
+      if (isOpenChat) {
+        setMessages((prev) => (prev.some((m) => m.id === transformed.id) ? prev : [...prev, transformed]));
+      }
+
+      const existsInContacts = contactsRef.current.some((c) => c.id === otherPartyId);
+      if (existsInContacts) {
+        setContacts((prev) =>
+          prev.map((c) =>
+            c.id === otherPartyId
+              ? {
+                  ...c,
+                  lastMessage: transformed.text,
+                  unread: rawMessage.senderId !== user.id && !isOpenChat ? (c.unread || 0) + 1 : c.unread,
+                }
+              : c
+          )
+        );
+      } else {
+        // Brand-new conversation partner we haven't seen before - fetch their full profile
+        refreshChatsList();
+      }
+    };
+
+    const handlePresenceUpdate = ({ userId, status, lastActive }) => {
+      const patch = (list) => list.map((c) => (c.id === userId ? { ...c, status, lastActive } : c));
+      setContacts(patch);
+      setSavedContacts(patch);
+      setSelectedContact((prev) => (prev?.id === userId ? { ...prev, status, lastActive } : prev));
+    };
+
+    const handleProfileUpdate = ({ id, name, avatarUrl }) => {
+      const patch = (list) => list.map((c) => (c.id === id ? { ...c, name, avatarUrl } : c));
+      setContacts(patch);
+      setSavedContacts(patch);
+      setSelectedContact((prev) => (prev?.id === id ? { ...prev, name, avatarUrl } : prev));
+    };
+
+    const handleTypingStart = ({ fromUserId }) => {
+      if (selectedContactRef.current?.id === fromUserId) setIsContactTyping(true);
+    };
+
+    const handleTypingStop = ({ fromUserId }) => {
+      if (selectedContactRef.current?.id === fromUserId) setIsContactTyping(false);
+    };
+
+    socket.on('message:new', handleNewMessage);
+    socket.on('presence:update', handlePresenceUpdate);
+    socket.on('profile:update', handleProfileUpdate);
+    socket.on('typing:start', handleTypingStart);
+    socket.on('typing:stop', handleTypingStop);
+
+    return () => {
+      socket.off('message:new', handleNewMessage);
+      socket.off('presence:update', handlePresenceUpdate);
+      socket.off('profile:update', handleProfileUpdate);
+      socket.off('typing:start', handleTypingStart);
+      socket.off('typing:stop', handleTypingStop);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Load contacts from localStorage and backend on mount
+  // Load saved contacts from the backend. Presence/profile changes arrive live via
+  // sockets, so this only needs to run occasionally as a safety net.
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadSavedContacts = async () => {
+      try {
+        const list = await getSavedContacts();
+        if (isMounted) setSavedContacts(list);
+      } catch (error) {
+        console.error('Error loading saved contacts:', error);
+      }
+    };
+
+    loadSavedContacts();
+    const interval = setInterval(loadSavedContacts, 30000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Re-fetch the "All Chats" list from the backend, adding any brand-new
+  // conversation partners without disturbing unread counts already in state.
+  const refreshChatsList = async () => {
+    try {
+      const backendContacts = await getContactsWithMessages();
+      const transformed = backendContacts.map((c) => ({
+        id: c.id,
+        name: c.name,
+        email: c.email,
+        lastMessage: c.lastMessage || 'No messages yet',
+        unread: 0,
+        status: c.status,
+        lastActive: c.lastActive,
+        avatarUrl: c.avatarUrl,
+      }));
+
+      setContacts((prev) => {
+        const map = new Map(prev.map((c) => [c.id, c]));
+        transformed.forEach((c) => {
+          if (!map.has(c.id)) map.set(c.id, c);
+        });
+        return Array.from(map.values());
+      });
+    } catch (error) {
+      console.error('Error refreshing chats list:', error);
+    }
+  };
+
+  // Load contacts (chats) from localStorage and backend on mount
   useEffect(() => {
     const loadContacts = async () => {
       try {
@@ -77,7 +300,7 @@ function Chat({ user, onSignOut, onUpdateUser }) {
         // Then, fetch contacts from backend that have messages
         try {
           const backendContacts = await getContactsWithMessages();
-          
+
           // Transform backend contacts to match our contact format
           const transformedBackendContacts = backendContacts.map((contact) => ({
             id: contact.id,
@@ -92,43 +315,11 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
           // Merge local and backend contacts, avoiding duplicates
           const contactMap = new Map();
-          
+
           // Add local contacts first
           localContacts.forEach((contact) => {
             contactMap.set(contact.id, contact);
           });
-
-          // Add or update with backend contacts (backend has more recent lastMessage)
-          // Also calculate unread counts for all contacts
-          const updateUnreadCounts = async () => {
-            for (const contact of Array.from(contactMap.values())) {
-              try {
-                const messages = await getMessages(contact.id);
-                const transformedMessages = messages.map((msg) => ({
-                  id: msg.id,
-                  text: msg.text,
-                  sender: msg.senderId,
-                  senderName: msg.senderName,
-                  timestamp: msg.createdAt,
-                }));
-                const lastRead = getLastReadTimestamp(contact.id);
-                const unreadCount = calculateUnreadCount(transformedMessages, contact.id, lastRead);
-                
-                const existing = contactMap.get(contact.id);
-                if (existing) {
-                  contactMap.set(contact.id, {
-                    ...existing,
-                    unread: unreadCount,
-                  });
-                }
-              } catch (error) {
-                console.error(`Error calculating unread for contact ${contact.id}:`, error);
-              }
-            }
-            
-            const mergedContacts = Array.from(contactMap.values());
-            setContacts(mergedContacts);
-          };
 
           transformedBackendContacts.forEach((contact) => {
             const existing = contactMap.get(contact.id);
@@ -147,8 +338,24 @@ function Chat({ user, onSignOut, onUpdateUser }) {
             }
           });
 
-          // Calculate unread counts for all contacts
-          updateUnreadCounts();
+          // Calculate initial unread counts (backlog from before this session)
+          for (const contact of Array.from(contactMap.values())) {
+            try {
+              const { messages: fetched } = await getMessages(contact.id, { limit: 200 });
+              const transformedMessages = fetched.map(transformMessage);
+              const lastRead = getLastReadTimestamp(contact.id);
+              const unreadCount = calculateUnreadCount(transformedMessages, contact.id, lastRead);
+
+              const existing = contactMap.get(contact.id);
+              if (existing) {
+                contactMap.set(contact.id, { ...existing, unread: unreadCount });
+              }
+            } catch (error) {
+              console.error(`Error calculating unread for contact ${contact.id}:`, error);
+            }
+          }
+
+          setContacts(Array.from(contactMap.values()));
         } catch (error) {
           console.error('Error loading contacts from backend:', error);
           // If backend fails, still use local contacts
@@ -162,29 +369,15 @@ function Chat({ user, onSignOut, onUpdateUser }) {
     };
 
     loadContacts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [CONTACTS_STORAGE_KEY]);
 
-  // Keep the selected contact's presence/profile in sync as `contacts` is refreshed in the background
-  useEffect(() => {
-    if (!selectedContact) return;
-    const updated = contacts.find((c) => c.id === selectedContact.id);
-    if (
-      updated &&
-      (updated.status !== selectedContact.status ||
-        updated.lastActive !== selectedContact.lastActive ||
-        updated.avatarUrl !== selectedContact.avatarUrl ||
-        updated.name !== selectedContact.name)
-    ) {
-      setSelectedContact(updated);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contacts]);
-
-  // Save contacts to localStorage whenever they change
+  // Save contacts to localStorage whenever they change, and keep a ref in sync
+  // for use inside long-lived socket listeners.
   useEffect(() => {
     try {
       localStorage.setItem(CONTACTS_STORAGE_KEY, JSON.stringify(contacts));
-      contactsRef.current = contacts; // Keep ref in sync
+      contactsRef.current = contacts;
     } catch (error) {
       console.error('Error saving contacts to localStorage:', error);
     }
@@ -192,275 +385,63 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
   // Load messages when a contact is selected
   useEffect(() => {
+    setIsContactTyping(false);
     if (selectedContact) {
       loadMessages(selectedContact.id);
     } else {
       setMessages([]);
+      setHasMoreMessages(false);
     }
-  }, [selectedContact]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedContact?.id]);
 
   // Mark messages as read when contact is selected and messages are loaded
   useEffect(() => {
     if (selectedContact && messages.length > 0) {
-      // Small delay to ensure messages are displayed before marking as read
       const timer = setTimeout(() => {
         markAsRead(selectedContact.id, messages);
-        // Force a poll update after marking as read to refresh unread counts
-        // This ensures that when you click away, the counts are correct
       }, 1000);
       return () => clearTimeout(timer);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedContact?.id, messages.length]);
 
-  // Poll for new messages to update unread counts continuously (lightweight, non-blocking)
-  useEffect(() => {
-    let isMounted = true;
-    let pollInterval = null;
-    let isPolling = false;
-    
-    const updateUnreadForContact = async (contact) => {
-      // Always calculate unread count for all contacts
-      // If contact is selected and messages are marked as read, unread will be 0
-      
-      try {
-        const messages = await getMessages(contact.id);
-        const transformedMessages = messages.map((msg) => ({
-          id: msg.id,
-          text: msg.text,
-          sender: msg.senderId,
-          senderName: msg.senderName,
-          timestamp: msg.createdAt,
-        }));
-        
-        const lastRead = getLastReadTimestamp(contact.id);
-        const unreadCount = calculateUnreadCount(transformedMessages, contact.id, lastRead);
-        
-        return {
-          ...contact,
-          unread: unreadCount,
-        };
-      } catch (error) {
-        console.error(`Error updating unread for contact ${contact.id}:`, error);
-        return contact;
-      }
-    };
-    
-    const pollUnreadCounts = async () => {
-      if (!isMounted || isPolling) return;
-      
-      isPolling = true;
-      
-      try {
-        // Use functional update to get latest contacts from state
-        setContacts((prevContacts) => {
-          if (!prevContacts || prevContacts.length === 0) {
-            isPolling = false;
-            return prevContacts;
-          }
-          
-          // Update unread counts asynchronously
-          (async () => {
-            try {
-              const updatedContacts = [];
-              for (const contact of prevContacts) {
-                const updated = await updateUnreadForContact(contact);
-                updatedContacts.push(updated);
-                
-                // Small delay between each contact to avoid blocking
-                await new Promise(resolve => setTimeout(resolve, 50));
-              }
-              
-              if (isMounted) {
-                setContacts(updatedContacts);
-              }
-            } catch (error) {
-              console.error('Error in async unread update:', error);
-            } finally {
-              isPolling = false;
-            }
-          })();
-          
-          return prevContacts; // Return immediately, update will happen async
-        });
-      } catch (error) {
-        console.error('Error polling unread counts:', error);
-      } finally {
-        isPolling = false;
-      }
-    };
-
-    // Start polling after initial delay, then every 3 seconds (more frequent)
-    const initialTimeout = setTimeout(() => {
-      if (isMounted) {
-        pollUnreadCounts();
-        pollInterval = setInterval(pollUnreadCounts, 3000);
-      }
-    }, 1000);
-    
-    return () => {
-      isMounted = false;
-      clearTimeout(initialTimeout);
-      if (pollInterval) clearInterval(pollInterval);
-    };
-  }, [selectedContact?.id]);
-
-  // Poll for new messages when a contact is selected
-  useEffect(() => {
-    if (!selectedContact) return;
-
-    const pollInterval = setInterval(() => {
-      // Poll silently (without showing loading state) to check for new messages
-      const contactId = selectedContact.id;
-      loadMessages(contactId, true);
-    }, 3000); // Check every 3 seconds
-
-    return () => clearInterval(pollInterval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedContact?.id]);
-
-  // Periodically check for new contacts and update unread counts
-  useEffect(() => {
-    const checkForNewContacts = async () => {
-      try {
-        const backendContacts = await getContactsWithMessages();
-        const transformedBackendContacts = backendContacts.map((contact) => ({
-          id: contact.id,
-          name: contact.name,
-          email: contact.email,
-          lastMessage: contact.lastMessage || 'No messages yet',
-          unread: 0,
-          status: contact.status,
-          lastActive: contact.lastActive,
-          avatarUrl: contact.avatarUrl,
-        }));
-
-        // Update contacts list with any new contacts from backend
-        setContacts((prevContacts) => {
-          const contactMap = new Map();
-          prevContacts.forEach((contact) => {
-            contactMap.set(contact.id, contact);
-          });
-
-          transformedBackendContacts.forEach((contact) => {
-            const existing = contactMap.get(contact.id);
-            if (existing) {
-              // Update last message and presence
-              contactMap.set(contact.id, {
-                ...existing,
-                lastMessage: contact.lastMessage,
-                status: contact.status,
-                lastActive: contact.lastActive,
-                avatarUrl: contact.avatarUrl,
-              });
-            } else {
-              // Add new contact
-              contactMap.set(contact.id, contact);
-            }
-          });
-
-          // Update unread counts for all contacts (except currently selected)
-          const updateUnreadCounts = async () => {
-            const updatedContacts = Array.from(contactMap.values());
-            for (const contact of updatedContacts) {
-              // Skip if this contact is currently selected
-              if (selectedContact?.id === contact.id) continue;
-              
-              try {
-                const messages = await getMessages(contact.id);
-                const transformedMessages = messages.map((msg) => ({
-                  id: msg.id,
-                  text: msg.text,
-                  sender: msg.senderId,
-                  senderName: msg.senderName,
-                  timestamp: msg.createdAt,
-                }));
-                const lastRead = getLastReadTimestamp(contact.id);
-                const unreadCount = calculateUnreadCount(transformedMessages, contact.id, lastRead);
-                
-                contactMap.set(contact.id, {
-                  ...contact,
-                  unread: unreadCount,
-                });
-              } catch (error) {
-                console.error(`Error updating unread for contact ${contact.id}:`, error);
-              }
-            }
-            
-            setContacts(Array.from(contactMap.values()));
-          };
-
-          updateUnreadCounts();
-          return Array.from(contactMap.values());
-        });
-      } catch (error) {
-        console.error('Error checking for new contacts:', error);
-      }
-    };
-
-    // Check for new contacts every 5 seconds
-    const contactCheckInterval = setInterval(checkForNewContacts, 5000);
-    
-    // Also check immediately
-    checkForNewContacts();
-
-    return () => clearInterval(contactCheckInterval);
-  }, [selectedContact?.id]);
-
-  const loadMessages = async (contactId, silent = false) => {
-    if (!silent) {
-      setIsLoadingMessages(true);
-    }
+  const loadMessages = async (contactId) => {
+    setIsLoadingMessages(true);
+    setHasMoreMessages(false);
     try {
-      const fetchedMessages = await getMessages(contactId);
-      // Transform messages to match the format expected by the UI
-      const transformedMessages = fetchedMessages.map((msg) => ({
-        id: msg.id,
-        text: msg.text,
-        sender: msg.senderId,
-        senderName: msg.senderName,
-        timestamp: msg.createdAt,
-      }));
-      
-      // Only update if messages have changed (to avoid unnecessary re-renders during polling)
-      setMessages((prevMessages) => {
-        const prevIds = new Set(prevMessages.map(m => m.id));
-        const newIds = new Set(transformedMessages.map(m => m.id));
-        
-        // Check if there are new messages
-        const hasNewMessages = transformedMessages.some(m => !prevIds.has(m.id));
-        const hasDifferentCount = prevMessages.length !== transformedMessages.length;
-        
-        if (hasNewMessages || hasDifferentCount) {
-          return transformedMessages;
-        }
-        return prevMessages;
-      });
-      
-      // Update last message in contacts and calculate unread count
-      if (transformedMessages.length > 0) {
-        const lastMessage = transformedMessages[transformedMessages.length - 1];
-        updateContactLastMessage(contactId, lastMessage.text);
-        
-        // Always calculate unread count, but only update if contact is not selected
-        // (if selected, it will be marked as read shortly)
-        const lastRead = getLastReadTimestamp(contactId);
-        const unreadCount = calculateUnreadCount(transformedMessages, contactId, lastRead);
-        
-        // Only update unread count if this contact is NOT currently selected
-        // (selected contacts will be marked as read, so unread should be 0)
-        if (selectedContact?.id !== contactId) {
-          updateContactUnread(contactId, unreadCount);
-        }
+      const { messages: fetched, hasMore } = await getMessages(contactId, { limit: 50 });
+      const transformed = fetched.map(transformMessage);
+      setMessages(transformed);
+      setHasMoreMessages(hasMore);
+
+      if (transformed.length > 0) {
+        updateContactLastMessage(contactId, transformed[transformed.length - 1].text);
       }
     } catch (error) {
       console.error('Error loading messages:', error);
-      if (!silent) {
-        setMessages([]);
-      }
+      setMessages([]);
     } finally {
-      if (!silent) {
-        setIsLoadingMessages(false);
-      }
+      setIsLoadingMessages(false);
+    }
+  };
+
+  const loadOlderMessages = async () => {
+    if (!selectedContact || !hasMoreMessages || isLoadingOlderMessages) return;
+    const oldestId = messages[0]?.id;
+    if (!oldestId) return;
+
+    setIsLoadingOlderMessages(true);
+    try {
+      const { messages: fetched, hasMore } = await getMessages(selectedContact.id, { before: oldestId, limit: 50 });
+      const transformed = fetched.map(transformMessage);
+      shouldAutoScrollRef.current = false;
+      setMessages((prev) => [...transformed, ...prev]);
+      setHasMoreMessages(hasMore);
+    } catch (error) {
+      console.error('Error loading older messages:', error);
+    } finally {
+      setIsLoadingOlderMessages(false);
     }
   };
 
@@ -479,18 +460,15 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
   const markAsRead = (contactId, messages) => {
     if (messages.length === 0) return;
-    
+
     try {
       const lastReadData = localStorage.getItem(LAST_READ_STORAGE_KEY);
       const parsed = lastReadData ? JSON.parse(lastReadData) : {};
-      
-      // Get the most recent message timestamp
+
       const lastMessage = messages[messages.length - 1];
       parsed[contactId] = lastMessage.timestamp;
-      
+
       localStorage.setItem(LAST_READ_STORAGE_KEY, JSON.stringify(parsed));
-      
-      // Update unread count to 0
       updateContactUnread(contactId, 0);
     } catch (error) {
       console.error('Error marking as read:', error);
@@ -499,58 +477,33 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
   const calculateUnreadCount = (messages, contactId, lastReadTimestamp) => {
     if (!lastReadTimestamp) {
-      // If no last read timestamp, count all messages received from this contact
-      const unreadMessages = messages.filter(msg => {
-        const senderId = msg.senderId || msg.sender;
-        return senderId !== user.id;
-      });
-      console.log(`No last read timestamp for contact ${contactId}, unread count: ${unreadMessages.length}`);
-      return unreadMessages.length;
+      return messages.filter((msg) => (msg.senderId || msg.sender) !== user.id).length;
     }
-    
-    // Count messages received after the last read timestamp
-    // Use >= instead of > to handle edge cases, but we'll filter out exact matches
+
     const lastReadDate = new Date(lastReadTimestamp);
-    const unreadMessages = messages.filter(msg => {
+    return messages.filter((msg) => {
       const senderId = msg.senderId || msg.sender;
       const messageTime = new Date(msg.timestamp || msg.createdAt);
-      // Message is unread if it's from the contact AND it's after the last read time
-      // We use > (not >=) to exclude the message that was just marked as read
-      const isUnread = senderId !== user.id && messageTime > lastReadDate;
-      return isUnread;
-    });
-    
-    console.log(`Contact ${contactId}: ${unreadMessages.length} unread messages (last read: ${lastReadTimestamp}, total messages: ${messages.length})`);
-    return unreadMessages.length;
+      return senderId !== user.id && messageTime > lastReadDate;
+    }).length;
   };
 
   const updateContactUnread = (contactId, unreadCount) => {
     setContacts((prevContacts) =>
-      prevContacts.map((contact) => {
-        if (contact.id === contactId) {
-          console.log(`Updating unread count for contact ${contactId}: ${unreadCount}`);
-          return { ...contact, unread: unreadCount };
-        }
-        return contact;
-      })
+      prevContacts.map((contact) => (contact.id === contactId ? { ...contact, unread: unreadCount } : contact))
     );
   };
 
   const updateContactLastMessage = (contactId, lastMessageText) => {
     setContacts((prevContacts) =>
-      prevContacts.map((contact) =>
-        contact.id === contactId
-          ? { ...contact, lastMessage: lastMessageText }
-          : contact
-      )
+      prevContacts.map((contact) => (contact.id === contactId ? { ...contact, lastMessage: lastMessageText } : contact))
     );
   };
 
   const handleRemoveContact = (e, contactId) => {
-    e.stopPropagation(); // Prevent selecting the contact when clicking close
+    e.stopPropagation();
     setContacts((prevContacts) => prevContacts.filter((contact) => contact.id !== contactId));
-    
-    // If the removed contact was selected, clear selection
+
     if (selectedContact?.id === contactId) {
       setSelectedContact(null);
       setMessages([]);
@@ -562,8 +515,37 @@ function Chat({ user, onSignOut, onUpdateUser }) {
   };
 
   useEffect(() => {
-    scrollToBottom();
+    if (shouldAutoScrollRef.current) {
+      scrollToBottom();
+    }
+    shouldAutoScrollRef.current = true;
   }, [messages]);
+
+  const stopTypingSignal = () => {
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
+    }
+    if (selectedContact) {
+      getSocket()?.emit('typing:stop', { toUserId: selectedContact.id });
+    }
+  };
+
+  const handleMessageInputChange = (e) => {
+    setNewMessage(e.target.value);
+    if (!selectedContact) return;
+
+    const socket = getSocket();
+    if (!socket) return;
+
+    socket.emit('typing:start', { toUserId: selectedContact.id });
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      socket.emit('typing:stop', { toUserId: selectedContact.id });
+      typingTimeoutRef.current = null;
+    }, 2000);
+  };
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
@@ -571,6 +553,7 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
     const messageText = newMessage.trim();
     setNewMessage('');
+    stopTypingSignal();
 
     // Optimistically add message to UI
     const optimisticMessage = {
@@ -585,14 +568,15 @@ function Chat({ user, onSignOut, onUpdateUser }) {
     updateContactLastMessage(selectedContact.id, messageText);
 
     try {
-      // Send message to backend - ensure receiverId is a number
-      const receiverId = typeof selectedContact.id === 'number' 
-        ? selectedContact.id 
+      const receiverId = typeof selectedContact.id === 'number'
+        ? selectedContact.id
         : parseInt(selectedContact.id);
-      
+
       const savedMessage = await sendMessage(receiverId, messageText);
-      
-      // Replace optimistic message with real one from server
+
+      // Replace optimistic message with the real one from the server
+      // (the server also pushes this same message back over the socket -
+      // that handler dedupes by id, so this just settles first)
       setMessages((prevMessages) => {
         const filtered = prevMessages.filter((msg) => msg.id !== optimisticMessage.id);
         return [
@@ -606,16 +590,11 @@ function Chat({ user, onSignOut, onUpdateUser }) {
           },
         ];
       });
-      
-      // Update last message in contacts
+
       updateContactLastMessage(selectedContact.id, messageText);
     } catch (error) {
       console.error('Error sending message:', error);
-      // Remove optimistic message on error
-      setMessages((prevMessages) =>
-        prevMessages.filter((msg) => msg.id !== optimisticMessage.id)
-      );
-      // Restore message text so user can retry
+      setMessages((prevMessages) => prevMessages.filter((msg) => msg.id !== optimisticMessage.id));
       setNewMessage(messageText);
       alert('Failed to send message. Please try again.');
     }
@@ -635,7 +614,7 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 
   const handleSearch = async (query) => {
     setSearchQuery(query);
-    
+
     if (!query.trim()) {
       setSearchResults([]);
       setIsSearching(false);
@@ -654,14 +633,20 @@ function Chat({ user, onSignOut, onUpdateUser }) {
     }
   };
 
-  const handleAddContact = (userToAdd) => {
-    // Check if contact already exists
-    const contactExists = contacts.find(c => c.id === userToAdd.id);
+  const handleAddContact = async (userToAdd) => {
+    // Persist as a saved contact
+    try {
+      const added = await addContactApi(userToAdd.id);
+      setSavedContacts((prev) => (prev.some((c) => c.id === added.id) ? prev : [added, ...prev]));
+    } catch (error) {
+      console.error('Error adding contact:', error);
+    }
+
+    // Also open/select the chat, even if there's no message history yet
+    const contactExists = contacts.find((c) => c.id === userToAdd.id);
     if (contactExists) {
-      // If exists, just select it
       setSelectedContact(contactExists);
     } else {
-      // Add new contact
       const newContact = {
         id: userToAdd.id,
         name: userToAdd.name,
@@ -679,6 +664,32 @@ function Chat({ user, onSignOut, onUpdateUser }) {
     setSearchQuery('');
     setSearchResults([]);
   };
+
+  // Add a person from the "All Chats" list into saved Contacts
+  const handleAddToContactsFromChat = async (e, person) => {
+    e.stopPropagation();
+    try {
+      const added = await addContactApi(person.id);
+      setSavedContacts((prev) => (prev.some((c) => c.id === added.id) ? prev : [added, ...prev]));
+    } catch (error) {
+      console.error('Error adding contact:', error);
+    }
+  };
+
+  // Remove a person from saved Contacts (does not affect chat/message history)
+  const handleRemoveSavedContact = async (e, contactId) => {
+    e.stopPropagation();
+    try {
+      await removeContactApi(contactId);
+      setSavedContacts((prev) => prev.filter((c) => c.id !== contactId));
+    } catch (error) {
+      console.error('Error removing contact:', error);
+    }
+  };
+
+  const selectedEffectiveStatus = selectedContact
+    ? getEffectiveStatus(selectedContact.status, selectedContact.lastActive)
+    : null;
 
   return (
     <div className="chat-app">
@@ -722,19 +733,23 @@ function Chat({ user, onSignOut, onUpdateUser }) {
           )}
 
           <div className="contacts-section">
-            <div className="contacts-header">
-              <h3>Contacts</h3>
-            </div>
-            
             {/* Search Input */}
             <div className="search-container">
-              <input
-                type="text"
-                placeholder="Search users..."
-                value={searchQuery}
-                onChange={(e) => handleSearch(e.target.value)}
-                className="search-input"
-              />
+              <div className="search-input-wrapper">
+                <span className="search-icon">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="11" cy="11" r="7"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                </span>
+                <input
+                  type="text"
+                  placeholder="Search users..."
+                  value={searchQuery}
+                  onChange={(e) => handleSearch(e.target.value)}
+                  className="search-input"
+                />
+              </div>
               {isSearching && <div className="search-loading">Searching...</div>}
             </div>
 
@@ -759,42 +774,68 @@ function Chat({ user, onSignOut, onUpdateUser }) {
             )}
 
             <div className="contacts-list">
-              {contacts.length === 0 ? (
-                <div className="no-contacts">
-                  <p>No contacts yet</p>
-                  <p className="no-contacts-hint">Contacts will appear here when you start chatting</p>
-                </div>
-              ) : (
-                contacts.map((contact) => (
-                  <div
-                    key={contact.id}
-                    className={`contact-item ${selectedContact?.id === contact.id ? 'active' : ''} ${contact.unread > 0 ? 'has-unread' : ''}`}
-                    onClick={() => setSelectedContact(contact)}
-                  >
-                    <div className="avatar-wrapper">
-                      <Avatar name={contact.name} avatarUrl={contact.avatarUrl} className="contact-avatar" />
-                      <StatusDot status={getEffectiveStatus(contact.status, contact.lastActive)} />
+              {/* Saved Contacts */}
+              <div className="contacts-group">
+                <ContactsGroupHeader
+                  title="Contacts"
+                  isOpen={isContactsOpen}
+                  onToggle={() => setIsContactsOpen((open) => !open)}
+                />
+                {isContactsOpen && (
+                  savedContacts.length === 0 ? (
+                    <div className="no-contacts">
+                      <p>No contacts yet</p>
+                      <p className="no-contacts-hint">Search above, or add someone from All Chats</p>
                     </div>
-                    <div className="contact-info">
-                      <div className="contact-name">{contact.name}</div>
-                      <div className="contact-last-message">{contact.lastMessage}</div>
+                  ) : (
+                    savedContacts.map((saved) => {
+                      const chat = contacts.find((c) => c.id === saved.id);
+                      const person = chat ? { ...saved, ...chat } : { ...saved, lastMessage: 'No messages yet', unread: 0 };
+                      return (
+                        <ContactRow
+                          key={saved.id}
+                          person={person}
+                          isActive={selectedContact?.id === saved.id}
+                          isSaved
+                          onSelect={setSelectedContact}
+                          onRemove={handleRemoveSavedContact}
+                          removeTitle="Remove from contacts"
+                        />
+                      );
+                    })
+                  )
+                )}
+              </div>
+
+              {/* All Chats (people you've exchanged messages with) */}
+              <div className="contacts-group">
+                <ContactsGroupHeader
+                  title="All Chats"
+                  isOpen={isChatsOpen}
+                  onToggle={() => setIsChatsOpen((open) => !open)}
+                />
+                {isChatsOpen && (
+                  contacts.length === 0 ? (
+                    <div className="no-contacts">
+                      <p>No chats yet</p>
+                      <p className="no-contacts-hint">Chats will appear here once you start messaging</p>
                     </div>
-                    {contact.unread > 0 && (
-                      <div className="unread-badge">{contact.unread}</div>
-                    )}
-                    <button
-                      className="contact-close-btn"
-                      onClick={(e) => handleRemoveContact(e, contact.id)}
-                      title="Remove contact"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                      </svg>
-                    </button>
-                  </div>
-                ))
-              )}
+                  ) : (
+                    contacts.map((chat) => (
+                      <ContactRow
+                        key={chat.id}
+                        person={chat}
+                        isActive={selectedContact?.id === chat.id}
+                        isSaved={savedContacts.some((c) => c.id === chat.id)}
+                        onSelect={setSelectedContact}
+                        onAddToContacts={handleAddToContactsFromChat}
+                        onRemove={handleRemoveContact}
+                        removeTitle="Remove from chats"
+                      />
+                    ))
+                  )
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -808,12 +849,12 @@ function Chat({ user, onSignOut, onUpdateUser }) {
                 <div className="chat-header-info">
                   <div className="avatar-wrapper">
                     <Avatar name={selectedContact.name} avatarUrl={selectedContact.avatarUrl} className="chat-avatar" />
-                    <StatusDot status={getEffectiveStatus(selectedContact.status, selectedContact.lastActive)} />
+                    <StatusDot status={selectedEffectiveStatus} />
                   </div>
                   <div>
                     <div className="chat-contact-name">{selectedContact.name}</div>
-                    <div className={`chat-contact-status chat-contact-status-${getEffectiveStatus(selectedContact.status, selectedContact.lastActive)}`}>
-                      {STATUS_LABELS[getEffectiveStatus(selectedContact.status, selectedContact.lastActive)]}
+                    <div className={`chat-contact-status chat-contact-status-${selectedEffectiveStatus}`}>
+                      {isContactTyping ? 'Typing...' : STATUS_LABELS[selectedEffectiveStatus]}
                     </div>
                   </div>
                 </div>
@@ -823,33 +864,45 @@ function Chat({ user, onSignOut, onUpdateUser }) {
               <div className="messages-container">
                 {isLoadingMessages ? (
                   <div className="no-messages">
-                    <div className="no-messages-icon">💬</div>
+                    <div className="empty-state-icon"><ChatBubbleIcon size={24} /></div>
                     <p>Loading messages...</p>
                   </div>
                 ) : messages.length === 0 ? (
                   <div className="no-messages">
-                    <div className="no-messages-icon">💬</div>
+                    <div className="empty-state-icon"><ChatBubbleIcon size={24} /></div>
                     <p>No messages yet</p>
                     <p className="no-messages-hint">Start the conversation by sending a message!</p>
                   </div>
                 ) : (
-                  messages.map((message) => (
-                    <div
-                      key={message.id}
-                      className={`message ${message.sender === user.id || message.senderId === user.id ? 'sent' : message.sender === 'system' ? 'system' : 'received'}`}
-                    >
-                      {(message.sender !== 'system' && message.sender !== user.id && message.senderId !== user.id) && (
-                        <div className="message-avatar">{message.senderName?.charAt(0).toUpperCase() || 'U'}</div>
-                      )}
-                      <div className="message-content">
+                  <>
+                    {hasMoreMessages && (
+                      <button
+                        type="button"
+                        className="load-older-btn"
+                        onClick={loadOlderMessages}
+                        disabled={isLoadingOlderMessages}
+                      >
+                        {isLoadingOlderMessages ? 'Loading...' : 'Load earlier messages'}
+                      </button>
+                    )}
+                    {messages.map((message) => (
+                      <div
+                        key={message.id}
+                        className={`message ${message.sender === user.id || message.senderId === user.id ? 'sent' : message.sender === 'system' ? 'system' : 'received'}`}
+                      >
                         {(message.sender !== 'system' && message.sender !== user.id && message.senderId !== user.id) && (
-                          <div className="message-sender">{message.senderName}</div>
+                          <div className="message-avatar">{message.senderName?.charAt(0).toUpperCase() || 'U'}</div>
                         )}
-                        <div className="message-text">{message.text}</div>
-                        <div className="message-time">{formatTime(message.timestamp || message.createdAt)}</div>
+                        <div className="message-content">
+                          {(message.sender !== 'system' && message.sender !== user.id && message.senderId !== user.id) && (
+                            <div className="message-sender">{message.senderName}</div>
+                          )}
+                          <div className="message-text">{message.text}</div>
+                          <div className="message-time">{formatTime(message.timestamp || message.createdAt)}</div>
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    ))}
+                  </>
                 )}
                 <div ref={messagesEndRef} />
               </div>
@@ -860,7 +913,7 @@ function Chat({ user, onSignOut, onUpdateUser }) {
                   <input
                     type="text"
                     value={newMessage}
-                    onChange={(e) => setNewMessage(e.target.value)}
+                    onChange={handleMessageInputChange}
                     placeholder="Type a message..."
                     className="message-input"
                   />
@@ -875,7 +928,7 @@ function Chat({ user, onSignOut, onUpdateUser }) {
             </>
           ) : (
             <div className="no-contact-selected">
-              <div className="no-contact-icon">💬</div>
+              <div className="empty-state-icon"><ChatBubbleIcon size={30} /></div>
               <h2>Select a contact to start chatting</h2>
               <p>Choose someone from the sidebar to begin a conversation</p>
             </div>
@@ -887,4 +940,3 @@ function Chat({ user, onSignOut, onUpdateUser }) {
 }
 
 export default Chat;
-

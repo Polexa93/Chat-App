@@ -65,8 +65,8 @@ function App() {
         if (password !== confirmPassword) {
           throw new Error('Passwords do not match');
         }
-        if (password.length < 6) {
-          throw new Error('Password must be at least 6 characters');
+        if (!/^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(password)) {
+          throw new Error('Password must be at least 8 characters and include a letter and a number');
         }
         const newUser = await signUp(name, email, password);
         setUser(newUser);
@@ -155,7 +155,7 @@ function App() {
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Enter your password"
                   required
-                  minLength={6}
+                  minLength={8}
                 />
                 <button
                   type="button"
@@ -180,7 +180,7 @@ function App() {
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder="Confirm your password"
                     required
-                    minLength={6}
+                    minLength={8}
                   />
                   <button
                     type="button"
@@ -201,7 +201,7 @@ function App() {
                   <input type="checkbox" />
                   <span>Remember me</span>
                 </label>
-                <a href="#" className="forgot-password">Forgot password?</a>
+                <button type="button" className="forgot-password">Forgot password?</button>
               </div>
             )}
 

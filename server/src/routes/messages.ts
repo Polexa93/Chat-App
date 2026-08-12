@@ -3,6 +3,7 @@ import Message from '../models/Message';
 import User from '../models/User';
 import { protect } from '../middleware/auth';
 import { AuthRequest } from '../types';
+import { emitNewMessage } from '../socket';
 
 const router = express.Router();
 
@@ -63,12 +64,16 @@ router.get('/:contactId', protect, async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const messages = await Message.getConversation(currentUserId, contactId);
+    const before = req.query.before ? parseInt(req.query.before as string) : undefined;
+    const limit = req.query.limit ? Math.min(parseInt(req.query.limit as string), 100) : 50;
+
+    const { messages, hasMore } = await Message.getConversation(currentUserId, contactId, { before, limit });
 
     res.status(200).json({
       success: true,
       data: {
         messages,
+        hasMore,
       },
     });
   } catch (error) {
@@ -116,6 +121,9 @@ router.post('/', protect, async (req: AuthRequest, res: Response) => {
       ...message,
       senderName: sender?.name || 'Unknown',
     };
+
+    // Push it to both participants in real time
+    emitNewMessage(currentUserId, message.receiverId, messageWithSender);
 
     res.status(201).json({
       success: true,
